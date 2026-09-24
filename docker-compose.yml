@@ -1,0 +1,22 @@
+services:
+  neo4j:
+    image: neo4j:5
+    environment:
+      # Fixed, dev-only, non-secret credentials for the local/CI throwaway
+      # container. Never used against Aura. See docs/plan-p0-p3.md Phase 0
+      # for why this isn't a ".env" value.
+      NEO4J_AUTH: neo4j/localtestpass123
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  neo4j_data:
