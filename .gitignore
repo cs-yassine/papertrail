@@ -3,6 +3,11 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+
+PAPERTRAIL_MASTER_CONTEXT.md
+var/
+*.sqlite
+
 # C extensions
 *.so
 
