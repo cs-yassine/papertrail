@@ -22,28 +22,42 @@
 
 ### 1. Model names
 
-**What could and could not be verified.** Secondary sources dated Sept 2026 agree with CLAUDE.md:
+> **Superseded 2026-09-24.** This section originally recorded a proposal from secondary sources,
+> confidence-rated, pending a live console read. That read has now happened — see `docs/costs.md`
+> for the full console output. The verdict below is the resolution, not another proposal.
 
-- Llama 3.1-8B and 3.3-70B left Groq's free and Developer tiers on 16 Aug 2026.
-- Groq's free tier now serves `gpt-oss-120b`, `gpt-oss-20b`, and two Qwen 27B variants.
-- Groq limits: ~30 RPM, 1,000 RPD, **8,000 TPM**, 200k TPD, per model, per organization.
+**What the live consoles actually said (`docs/costs.md`, read 2026-09-24):**
 
-The Groq and Google live consoles were **not** read. Only the project owner can do that.
+- Groq free tier confirms three usable chat models, each its own bucket: `openai/gpt-oss-120b`,
+  `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`. All three: ~30 RPM / 1K RPD / **8K TPM** / 200K TPD,
+  **per model**, not pooled — **~600K tokens/day total** across the three.
+- **Google AI Studio is unavailable for this project.** Configuring the project returns *"L'accès à
+  l'API de ce projet est limité. Veuillez configurer la facturation pour continuer."* — billing is
+  required before any free-tier access is granted at all, so there is no Gemini fallback to design
+  around. **The system is Groq-only.** This resolves decision (a)3 below and removes the
+  cross-provider fallback design from every phase.
 
-| Env var | Proposal | Confidence |
+| Env var | Resolved value | Role |
 |---|---|---|
-| `MODEL_SMALL` | `openai/gpt-oss-20b` (Groq), `reasoning_effort=low` | High on the model. The ID format comes from Groq's docs; confirm it via `GET /models` |
-| `MODEL_LARGE` | `openai/gpt-oss-120b` (Groq), `reasoning_effort=low` for extraction, `medium` for synthesis | High on the model; the effort levels are guesses until the audit runs |
-| `MODEL_SMALL_FALLBACK` / `MODEL_LARGE_FALLBACK` | A Gemini Flash-Lite and a Gemini Flash model from AI Studio | **Exact ID strings unknown.** Sources name "3.1/3.5 Flash-Lite" and disagree on RPD (500 vs 1,000). Copy the IDs from the AI Studio model list |
-| `MODEL_JUDGE` | Gemini Flash (not Lite), temp 0, pinned | Medium. It is a different family from the gpt-oss generators. **Catch:** when Groq quota runs out, generation falls back to Gemini, so eval runs log `served_by` on every call and flag any item where generator == judge |
-| Extraction pin | **Chosen from P1 audit results, not by default** (decision (a)3) | — |
+| `MODEL_LARGE` | `openai/gpt-oss-120b` | EXTRACTION (pinned, no fallback), SYNTHESIZE, CRITIQUE |
+| `MODEL_SMALL` | `openai/gpt-oss-20b` | REWRITE, PLAN, GRADE, ADJUDICATE (primary) |
+| `MODEL_JUDGE` | `qwen/qwen3.8-27b` | EVAL_JUDGE only — pinned, temp 0, **never used for generation** |
+| `MODEL_FALLBACK` | `qwen/qwen3.8-27b` | Third bucket; ADJUDICATE only, records `adjudicated_by` |
 
-> ⚠ **Before any job is sized, the project owner must read the live limits in the Groq console and in
-> AI Studio and record them, with the date, in `docs/costs.md`.**
->
-> The **8k TPM** limit binds before RPM does. One extraction call is ~3–5k tokens including
-> reasoning, so Groq allows about 2 extraction calls per minute. The spec's `max_concurrency=4` buys
-> nothing on Groq.
+Reasoning effort per task (`low`/`medium`) is still a guess until `make audit-budgets` runs in P1 —
+that part of the original uncertainty stands.
+
+**Judge independence, a documented compromise (not a gap to quietly work around):** MODEL_JUDGE and
+MODEL_FALLBACK are the same model. With Gemini gone, judge/generator separation rests on
+`qwen3.8-27b` being a different vendor and training lineage from the `gpt-oss` family — weaker than
+cross-provider independence. Non-negotiable consequences, carried into P5/P6 even though those
+phases aren't detailed in this document: eval runs assert **generator ≠ judge per item**, and any
+item where ADJUDICATE's fallback resolved to `qwen3.8-27b` mid-eval-construction is excluded and
+counted separately, never silently scored. The README's limitations section says this plainly.
+
+> ⚠ The **8k TPM** limit binds before RPM or TPD does. One extraction call is ~3–5k tokens including
+> reasoning, so Groq allows about 2 extraction calls per minute per bucket. The spec's
+> `max_concurrency=4` buys nothing on Groq — set concurrency to 1–2.
 
 ### 2. Are they reasoning models? Yes, both gpt-oss models are. Gemini Flash can also "think".
 
@@ -63,8 +77,8 @@ Groq counts hidden reasoning tokens against `max_completion_tokens`. This is the
     as-is**. It gets exactly one escalation (`max_tokens × REASONING_ESCALATION_FACTOR`, bounded in
     config) and then raises.
   - Empty content with any other finish reason → `EmptyCompletionError`, which may fall back to the
-    other provider **where the task allows fallback** (not EXTRACTION; see (a)3). It is logged loudly
-    because it always means something is wrong.
+    other **model** (single-provider system; not a cross-provider fallback) **where the task allows
+    it** (not EXTRACTION; see (a)3). It is logged loudly because it always means something is wrong.
   - Non-empty content that fails to parse → the structured repair path (one attempt).
 - **Reasoning tokens count against the 200k TPD.** The rate limiter and budget read
   `usage.completion_tokens_details.reasoning_tokens` when present and record it separately. It feeds
@@ -215,16 +229,19 @@ manifest (anchors first) is what makes P3's ≥15 plausible.
 
 ---
 
-### Phase 0 — Scaffold (on WSL2)
+### Phase 0 — Scaffold (native Windows, no WSL — superseded from the original WSL2 plan, see (a)1)
 
 **Environment steps (before any file is created)**
-- Move the project into the **WSL filesystem** (e.g. `~/code/papertrail`), not `/mnt/c/...`.
-  Cross-filesystem I/O is slow and breaks file watching. Today the folder is under
-  `C:\Users\...\Desktop` and holds only the two spec files, so moving it is trivial.
-- **Run Claude Code from inside WSL** from P0 on, so `make`, `uv` and `docker` resolve natively.
-- Docker: **Docker Engine inside WSL** (unambiguously free), or Docker Desktop with WSL integration.
-  Docker Desktop's free licence covers personal use; confirm it applies to you (Rule 0).
-- CI runs `ubuntu-latest`, giving parity with WSL.
+- Project stays at its current Windows path (`C:\Users\...\Desktop\Documents\work\PaperTrail`); no
+  filesystem move.
+- Claude Code runs natively on Windows (Git Bash + PowerShell tool access), not from inside WSL.
+  `make` and `uv` must resolve in that environment — `uv` installed via the official Windows
+  installer; `make` availability verified explicitly rather than assumed (Git Bash does not ship it).
+- Docker: **Docker Desktop for Windows**, confirmed working (`docker compose version` succeeds).
+  No WSL-integration-specific path-translation risk here since the Neo4j service needs no
+  host bind-mounts (see the CI-divergence list in the approval message for the full risk rundown).
+- CI still runs `ubuntu-latest`. Parity is no longer "same OS," so divergence risks (case
+  sensitivity, line endings, `make` version skew) are tracked explicitly rather than assumed away.
 
 **Files**
 
@@ -275,8 +292,10 @@ def imports_of(path: Path) -> set[str]: ...
 - The spike results are committed in `docs/spike-contradictions.md`.
 
 **Estimate:** 2.5h (the spec says 1.5).
-**Least sure:** WSL2 Docker networking to the Neo4j container (localhost forwarding), and whether
-Claude Code runs smoothly from WSL on this machine.
+**Least sure:** whether `make` (installed separately by the project owner, not by this session)
+actually resolves in the same shell environment Claude Code's tools use — flagged explicitly rather
+than assumed; and whether the Chocolatey-distributed GNU Make has any behavioural gaps against
+Ubuntu's for the constructs used here.
 
 ---
 
@@ -302,29 +321,30 @@ Claude Code runs smoothly from WSL on this machine.
 | `docs/adr/0008-budget-propagation-contextvar.md` | Decision B1 |
 | `docs/adr/0009-rate-limit-wait-not-retry.md` | Decision B3 |
 | `docs/adr/0010-reasoning-model-token-sizing.md` | Part A §2 |
-| `docs/adr/0012-extraction-provider-pin.md` | Which provider EXTRACTION is pinned to, and whether concepts stay folded in, **both decided from audit output** |
+| `docs/adr/0012-extraction-sizing-and-concepts.md` | Whether concepts stay folded into extraction, decided from audit output. (Renamed from "extraction-provider-pin" — that question is closed, see below) |
+| `docs/adr/0014-single-provider-with-retained-abstraction.md` | Why P1 still builds and unit-tests `RunnableWithFallbacks` against a `FakeChatModel` even though only Groq is live: it's a learning goal for this project and the concrete defense against Groq itself deprecating a model line (as it already did to Llama), not dead weight. Ships wired to one provider; the seam is proven, not exercised, against a second one |
 
-**What the P1 audit must answer** (from decisions (a)3 and (a)4)
+**What the P1 audit must answer** (from decision (a)4; (a)3 — provider pin — is now closed, see
+Part A §1)
 
 Only EXTRACTION and ADJUDICATE are audited now; they are the only tasks P0–P3 use. The other tasks
 are audited when their prompts exist (P7/P8). The prompts are drafts at this point, so the audit is
 **re-run at the start of P2** once the extraction prompt is final.
 
-1. **Extraction provider pin.** Run the same N papers (reuse the spike's 10) through each candidate
-   extraction model (Groq `gpt-oss-120b`, Gemini Flash). Compare, per model:
+1. **Extraction sizing on the pinned model.** Run the same N papers (reuse the spike's 10) through
+   `MODEL_LARGE` (`gpt-oss-120b`, the only candidate — no provider comparison needed now). Record:
    - tokens per paper, including reasoning;
    - empty-completion and parse-failure counts;
    - the claim count and a quick look at claim quality;
-   - **days to extract 100 papers under that provider's measured TPD/RPD**.
+   - **days to extract 100 papers under Groq's measured 200K TPD for this model's bucket**, cross-checked against `docs/costs.md`'s projection.
 
-   The pin goes in `EXTRACTION_PROVIDER` in config and ADR-0012. It is chosen by the project owner
-   from this table, not by default.
+   Feeds `MAX_TOKENS_EXTRACTION` and the reasoning-effort choice in config, recorded in ADR-0012.
 2. **Concepts cost.** Run the extraction prompt with and without the concepts field. Record the p95
    output+reasoning delta. **Decision rule:** if the with-concepts p95 fits inside
    `MAX_TOKENS_EXTRACTION` and the per-paper envelope, keep concepts folded in. Otherwise split
    concepts into their own call, recorded in ADR-0012.
-3. **ADJUDICATE tokens per call** with 5 candidates and with 3 candidates. This feeds the P3
-   projection and lever L1.
+3. **ADJUDICATE tokens per call** with 5 candidates and with 3 candidates, on `MODEL_SMALL`. This
+   feeds the P3 projection and lever L1.
 
 **Interfaces**
 
@@ -442,7 +462,7 @@ P3's candidate search needs both. This pulls scope forward; it is not a refactor
 | `ingestion/arxiv_client.py` | Metadata via the arXiv API, ≥3s between requests per arXiv's terms, httpx |
 | `ingestion/fetch_cache.py` | Raw HTML/XML on disk under `var/raw/`, so nothing is fetched twice |
 | `ingestion/parser.py` | Tries `arxiv.org/html/{id}` → ar5iv → abstract-only; pulls title, abstract, intro and conclusion; splits with `RecursiveCharacterTextSplitter` |
-| `ingestion/claim_extractor.py` | LCEL chain via `call_structured`, pinned to `EXTRACTION_PROVIDER` (no fallback). Records `extracted_by` (provider + model) and `extraction_prompt_version` on every claim (decision (a)3) |
+| `ingestion/claim_extractor.py` | LCEL chain via `call_structured`, pinned to `MODEL_LARGE` (no fallback). Records `extracted_by` (model) and `extraction_prompt_version` on every claim (decision (a)3) |
 | `ingestion/schema.py` | Constraints and indexes, idempotent (`IF NOT EXISTS`); uniqueness on `content_hash` |
 | `ingestion/writer.py` | One transaction per paper: MERGE Paper, Claims by `content_hash` with `status='active'`, HAS_CLAIM. Re-extraction under a new prompt version marks the paper's old claims **`superseded`** instead of deleting them (ADR-0004). **Then re-reads the counts to verify** (Lore lesson: a 200 is not a write) |
 | `ingestion/ledger.py` | Per-paper stage (`fetched → parsed → extracted → written`) and `extraction_prompt_version`, stored on the Paper node |
@@ -562,7 +582,7 @@ async def ingest(manifest: Path, limit: int, settings: Settings) -> IngestReport
 | `domain/projection.py` | Pure linking-cost projection math (below) |
 | `ingestion/concept_linker.py` | MERGE Concept and ABOUT from extraction output; `RELATED_TO` by embedding similarity, no LLM |
 | `ingestion/candidates.py` | Per claim: vector top-K, **other papers only**, `status=active` post-filtered with overfetch (correction #11), above `LINK_MIN_SIM`, capped at `LINK_CANDIDATES_K` (default 5), **minus pairs already in the pair ledger** |
-| `ingestion/relation_linker.py` | One call per claim with all candidates (small model; fallback allowed per (a)3). Writes one canonical direction; claims shown under neutral labels |
+| `ingestion/relation_linker.py` | One call per claim with all candidates (`MODEL_SMALL`; fallback to `MODEL_FALLBACK` allowed per (a)3, records `adjudicated_by`). Writes one canonical direction; claims shown under neutral labels |
 | `ingestion/pair_ledger.py` | Adjudicated unordered pairs (by hash), so B→A is never re-asked after A→B |
 | `scripts/project_linking.py` | Evaluates the trigger (below). Makes **zero LLM calls** except an optional `--sample 20` measured adjudication run |
 | `scripts/review_relations.py` | Prints N CONTRADICTS pairs with rationale and papers |
@@ -692,9 +712,9 @@ trigger:**
 
 | # | Question | Decision | Lands in |
 |---|---|---|---|
-| (a)1 | Windows toolchain | **WSL2.** The project lives in the WSL filesystem; Claude Code runs from WSL; `.gitattributes` forces LF | P0 |
+| (a)1 | Windows toolchain | **Superseded 2026-09-24: native Windows, not WSL2.** No Ubuntu-on-WSL was installed on this machine (only Docker Desktop's internal distro), and the project owner chose to stay native rather than set one up. The project lives at its original Windows path; `.gitattributes` forces LF; Makefile targets are written to run under Git Bash | P0 |
 | (a)2 | Freeze extraction at gold freeze | **Yes.** Prompt version + pinned model freeze with the gold set. `scripts/rekey_gold.py` is a working dry-run stub in P2 | P2 (ADR-0013), P5 |
-| (a)3 | Mixed-provider extraction | **Pinned to one provider, chosen from the P1 audit table.** Fallback allowed for ADJUDICATE. `extracted_by` always recorded | P1 (ADR-0012), P2 |
+| (a)3 | Mixed-provider extraction | **Closed 2026-09-24 — moot, not just decided.** Google AI Studio is unavailable for this project (billing required for any free-tier access; see `docs/costs.md`), so there is no second provider to mix. EXTRACTION pins to `MODEL_LARGE` (`gpt-oss-120b`) and waits out quota rather than falling back. ADJUDICATE may fall back to `MODEL_FALLBACK` (`qwen/qwen3.8-27b`) and records `adjudicated_by`. `extracted_by` always recorded. P1 still builds and unit-tests the fallback abstraction against a `FakeChatModel` (ADR-0014) — a defense against Groq itself deprecating a model, and a stated learning goal — but ships wired to one live provider | P1 (ADR-0012, ADR-0014), P2 |
 | (a)4 | Concepts folded into extraction | **Yes**, subject to the audit's output-token delta. If it breaks the envelope, split | P1 (ADR-0012) |
 | (a)5 | Neo4j source of truth | **Local Docker** as ingest target; Aura is a snapshot. Aura vector post-filter verified in **P4** | P2, P3, P4 |
 | (a)6 | Corpus selection | **Curated manifest**, anchors first | P2 |
@@ -705,8 +725,7 @@ trigger:**
 1. **`LINK_MAX_PROJECTED_DAYS`** (proposed 3) and **`LINK_QUOTA_UTILISATION`** (proposed 0.8). Needed
    by the P3 checkpoint.
 2. **Spike thresholds** (proposed: ≥8/12 recall, ≥5 real pairs). Fix them before running the spike.
-3. **Platform confirmation.** The approval message had an unfilled `[Linux/macOS/Windows]`
-   placeholder; this plan assumes Windows because the session reports Windows 11.
+3. ~~**Platform confirmation.**~~ **Resolved 2026-09-24** — see (a)1: native Windows, no WSL.
 
 ## Part E — Riskiest assumption (unchanged)
 

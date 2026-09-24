@@ -100,20 +100,30 @@ never change them afterwards:
 
 ---
 
-## Free-tier operating reality (verified Sept 2026 — re-verify in your own console)
+## Free-tier operating reality (verified 2026-09-24 in the live consoles — re-verify before any large job)
 
 Provider limits change frequently and the public numbers conflict. **Always read the live limits
 page in the console before sizing a job**, and record what you saw in `docs/costs.md` with a date.
+The full readings live there; this is the operating summary.
 
-- **Groq free**: organization-level, not per key. Roughly 30 RPM / 1,000 RPD / 200k **tokens per
-  day** on current models. Llama 3.1-8B and 3.3-70B were removed from the free tier in Aug 2026 —
-  the spec's model names are dead. Current free models are the `gpt-oss` family.
-- **`gpt-oss` models are reasoning models.** This is exactly the Lore incident: they spend the
-  output budget on internal reasoning and return **empty content** when `max_tokens` is sized for a
-  non-reasoning model. The non-empty assert in `llm/client.py` is not optional, and
+- **The system is Groq-only.** Gemini free tier (AI Studio) is **unavailable** for this project —
+  checked 2026-09-24, AI Studio requires billing to be configured before any API access is granted,
+  even at zero usage. Not a quota burned through; the free tier simply isn't offered. See
+  `docs/costs.md` for the exact console message. **Do not add a second provider speculatively** — if
+  Groq's capacity proves too tight, P2's measured numbers say so, and the candidate list (Cerebras,
+  GitHub Models, Cloudflare Workers AI) is in `docs/costs.md`.
+- **Groq free, three usable models, each with its own bucket**: `openai/gpt-oss-120b` (MODEL_LARGE),
+  `openai/gpt-oss-20b` (MODEL_SMALL), `qwen/qwen3.8-27b` (MODEL_JUDGE + MODEL_FALLBACK). Each is
+  ~30 RPM / 1K RPD / **8K TPM** / 200K TPD, **per model, not pooled** — routing tasks across all
+  three buys real throughput: **~600K tokens/day total**, not 200K.
+- **8K TPM binds before TPD does.** 200K ÷ 8K ≈ 25 minutes of full-rate use exhausts a day's bucket.
+  Ingestion is bursty by design: expect roughly half an hour of throughput per bucket per day, then a
+  clean stop until reset. `max_concurrency=4` (spec §5.3) buys nothing here — at ~3–5K tokens per
+  call, TPM allows ~2 calls/minute regardless of concurrency. Set concurrency to 1–2.
+- **`gpt-oss` and `qwen3.8-27b` are all reasoning models.** This is exactly the Lore incident: they
+  spend the output budget on internal reasoning and return **empty content** when `max_tokens` is
+  sized for a non-reasoning model. The non-empty assert in `llm/client.py` is not optional, and
   `scripts/audit_token_budgets.py` must run before the full ingest.
-- **Gemini free (AI Studio)**: per **project**, not per key. Flash-Lite models carry far higher RPD
-  than Flash. Pro models are paid-only. Numbers move; check AI Studio.
 - **Neo4j AuraDB Free**: one instance, pauses after **3 days** of inactivity, **deleted after 30
   days**. A paused instance's hostname does not even resolve. Keep-alive ping is mandatory.
   Node/relationship caps are well above this corpus either way.
@@ -121,16 +131,18 @@ page in the console before sizing a job**, and record what you saw in `docs/cost
 - **Langfuse**: free hobby tier. Tracing must be **optional via env** — a Langfuse outage or quota
   exhaustion must never fail a request or a CI run.
 
-**Consequence for ingestion (P2/P3):** a 200k token/day ceiling will not ingest 300 papers in one
-sitting. Therefore:
+**Consequence for ingestion (P2/P3):** ~600K tokens/day across three per-model buckets will not
+ingest 300 papers in one sitting. Therefore:
 - `scripts/ingest.py` is **resumable by default** — re-running skips completed papers via
   `content_hash`, and it exits cleanly on quota exhaustion with a resume hint, never a crash loop.
-- `llm/ratelimit.py` tracks RPM / TPM / RPD locally and **waits rather than burning retries**.
-  Honour the `retry-after` header on 429. Read `x-ratelimit-remaining-*` headers when present.
+- `llm/ratelimit.py` keys its counters by `(provider, model)` and **waits rather than burning
+  retries**. Honour the `retry-after` header on 429. Read `x-ratelimit-remaining-*` headers when
+  present.
 - Every raw LLM response is written to the on-disk cache (P1) so nothing is ever spent twice —
   including across re-runs, prompt-identical retries, and CI.
-- Relation linking in P3 sends **one call per claim carrying all 5 candidates**, not five calls.
-- **Start with 100 papers.** Ship v0.5 on 100. Extend to 300 only if quota allows.
+- Relation linking in P3 sends **one call per claim carrying all candidates**, not one per candidate.
+- **Start with 100 papers.** Ship v0.5 on 100. Extend to 300 only if quota allows — `docs/costs.md`'s
+  throughput projections say this is already multi-day at 100.
 
 ---
 
@@ -167,16 +179,32 @@ no LangChain memory classes, no `AgentExecutor`, no vector-store wrapper for ret
 ## Model routing
 
 All model names come from `config.py` env vars. Never hardcode one; never change routing without
-an eval delta.
+an eval delta. Single provider (Groq); see "Free-tier operating reality" for why.
 
-| Task | Tier |
+| Task | Model |
 |---|---|
-| `REWRITE`, `PLAN`, `GRADE`, `ADJUDICATE` | small |
-| `EXTRACTION`, `SYNTHESIZE`, `CRITIQUE` | large |
-| `EVAL_JUDGE` | large, **pinned, different from the generator**, temp 0 |
+| `REWRITE`, `PLAN`, `GRADE` | MODEL_SMALL (`gpt-oss-20b`) |
+| `ADJUDICATE` | MODEL_SMALL, **fallback to MODEL_FALLBACK allowed** |
+| `EXTRACTION` | MODEL_LARGE (`gpt-oss-120b`), **pinned, no fallback** — waits out quota instead, so the
+  corpus is extracted by one model with consistent claim granularity. `extracted_by` recorded on
+  every claim regardless |
+| `SYNTHESIZE`, `CRITIQUE` | MODEL_LARGE |
+| `EVAL_JUDGE` | MODEL_JUDGE (`qwen/qwen3.8-27b`), **pinned, temp 0, never used for generation** |
 
-`RunnableWithFallbacks` spans providers (Groq ⇄ Gemini) so one provider's daily quota exhaustion
-degrades to the other instead of failing. Log which provider actually served each call.
+`RunnableWithFallbacks` now spans **models on the same provider** (`gpt-oss-20b` ⇄
+`qwen/qwen3.8-27b`), not providers — there is only one provider. `adjudicated_by` records which
+model actually served an ADJUDICATE call when the fallback fires.
+
+**Judge independence is a documented compromise, not a clean guarantee.** With Gemini unavailable,
+MODEL_JUDGE and every generator share a provider; independence rests on `qwen3.8-27b` being a
+different vendor and training lineage from the `gpt-oss` family, which is weaker than cross-provider
+independence would have been. Non-optional consequences:
+- MODEL_JUDGE is never used for generation, and MODEL_FALLBACK must never resolve to the judge model
+  **during an eval run** — if ADJUDICATE's fallback fires mid-eval, those items are excluded and
+  counted separately, never silently scored.
+- Every call logs `served_by`; eval runs (P5/P6) assert generator ≠ judge **per item**.
+- **The README's limitations section says this plainly.** It is a real constraint of building for
+  free, not something to gloss over.
 
 ---
 
